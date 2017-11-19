@@ -1,0 +1,1 @@
+An example of a simple wayland client on Linux. Renders a fullscreen window flashing red, green, then blue. If you notice any errors let me know. 
