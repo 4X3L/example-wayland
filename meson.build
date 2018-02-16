@@ -1,6 +1,7 @@
-project('example_wayland', 'c', default_options : 'c_std=gnu99')
+project('example_wayland', 'c', default_options : 'c_std=gnu11')
 dependency('wayland-client')
-c_flags = ['-Wall', '-Wextra', '-pedantic', '-Werror', '-ggdb3', '-Og']
-ld_flags = ['-lwayland-client', '-lrt']
-src = ['src/main.c']
+dependency('xkbcommon')
+c_flags = ['-g', '-Og']
+ld_flags = ['-lwayland-client', '-lrt', '-lxkbcommon', '-lm']
+src = ['src/main.c', 'src/xdg-shell-unstable-v6-client-protocol.c', 'src/int_set.c']
 executable('example_wayland', src, c_args : c_flags, link_args : ld_flags)

@@ -1,6 +1,6 @@
 /* main.c
  * 
- * Copyright © 2017 Alex Benishek
+ * Copyright (c) 2018 Alex Benishek
  * 
  * Permission is hereby granted, free of charge, to any person obtaining 
  * a copy of this software and associated documentation files (the 
@@ -31,6 +31,9 @@
    https://cgit.freedesktop.org/wayland/wayland/tree/src/wayland-client.c
    https://cgit.freedesktop.org/wayland/wayland/tree/protocol/wayland.xml
    https://github.com/wayland-project/weston/blob/master/clients/window.c
+   https://github.com/eyelash/tutorials/blob/master/wayland-egl.c
+   https://github.com/eyelash/tutorials/blob/master/wayland-input.c
+   https://gist.github.com/Miouyouyou/ca15af1c7f2696f66b0e013058f110b4
 */
 
 #include <errno.h>
@@ -46,17 +49,14 @@
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
+#include <xkbcommon/xkbcommon.h>
 
-/* Wayland protocol specifies that all servers support ARGB (8-bit x4) layout so we 
-   will use that. */
-/* Little endian, so we layout the pixels in the reverse order than you'd expect */
-struct pixel
-{
-  uint8_t b;
-  uint8_t g;
-  uint8_t r;
-  uint8_t a;
-};
+#include "xdg-shell-unstable-v6-client-protocol.h"
+#include "int_set.h"
+
+#define container_of(ptr, type, member) ({                      \
+        const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+        (type *)( (char *)__mptr - offsetof(type,member) );})
 
 /* We will be checking if things failed a lot. */
 #define CHECK_COND(cond,label,fail,success) if (cond)                 \
@@ -80,40 +80,19 @@ struct pixel
     }                                                                   \
   else printf (success);
 
-/* What is the maximum number of screens that our program will recognize */
-#define MAX_OUTPUT 6
+// STRUCTS
 
-/* The confusing thing about wayland is that there are two main parts, a 
-   "meta-protocol" that can be used to define a "concrete-protocol" that the client
-   and server use to communicate. Because of this things like, 
-   "wl_registry_add_listener" and "wl_registry_bind" do not have definitions in 
-   wayland-client.h. Instead, they are found in an xml file in "protocol/wayland.xml"
-   in the wayland source code. The "meta-protocol" then uses this xml file to 
-   generate a concrete protocol that our client will use to actually communicate 
-   with the server. The only thing the "meta-protocol" provides is a way to 
-   communicate with the server, what is communicated is specified by 
-   "concrete-protocol". 
+/* Wayland protocol specifies that all servers support ARGB (8-bit x4) layout so we 
+   will use that. */
+/* Little endian, so we layout the pixels in the reverse order than you'd expect */
+struct pixel
+{
+  uint8_t b;
+  uint8_t g;
+  uint8_t r;
+  uint8_t a;
+};
 
-   Despite being written in C the concrete protocol is actually an object oriented 
-   protocol. The objects in the protocol are called "interfaces" The general form of 
-   "methods" are "<Wayland Namespace>_<Interface Name>_<Method Name>" So if we were
-   to write this in C++ this:
-
-   struct wl_registry *registry = wl_display_get_registry(...);
-   wl_registry_bind(registry, ...);
-
-   would look like this:
-   
-   wl::registry reg = display.get_registry(...);
-   reg.bind(...); 
-   
-   The order of parameters in a method is:
-   Object pointer, ... Protocol Specific Params ... , Protocol Version Number
-*/
-
-/* The API operates asynchronously so in order to get information about a display we 
-   have to create a callback which sets the data we want and then we send that
-   callback to the server and wait for a response. */
 struct output_info
 {
   int32_t width;
@@ -121,17 +100,79 @@ struct output_info
   int32_t hertz;
 };
 
-/* If we specify one callback to run once an event starts then we have to specify all 
-   events that the object supports. So we will want to give a dummy callback that 
-   does nothing. */
-static void do_nothing () {}
+struct ua_keyboard 
+{
+  struct wl_keyboard *kbd;
+  struct int_set pressed;
+  uint32_t buf_size;
+  int keymap_fd;
+  struct xkb_context *ctx;
+  struct xkb_keymap *map;
+  struct xkb_state *kb_state;
+};
+
+struct input_bundle
+{
+  struct ua_keyboard keyboard;
+  struct wl_pointer *mouse;
+  struct wl_seat *seat;
+};
+
+struct ua_wayland_data 
+{
+  struct wl_display *display;
+  struct wl_registry *registry;
+  struct wl_compositor *compositor;
+  struct wl_surface *surface;
+  struct zxdg_surface_v6 *shell_surface;
+  struct zxdg_shell_v6 *shell;
+  struct zxdg_toplevel_v6 *top;
+  struct wl_shm *shm;
+  /* List of outputs */
+  struct wl_list *monitors;
+  struct input_bundle inputs;
+};
+
+struct ua_wayland_output
+{
+  struct wl_output *out;
+  struct output_info info;
+  struct wl_list link;
+};
+
+struct mem 
+{
+  void *raw;
+  size_t raw_size;
+  int fd;
+  struct wl_shm_pool *pool;
+};
+
+struct ua_buffer
+{
+  uint32_t width;
+  uint32_t height;
+  struct ua_double_buffer_list *bufs;
+};
+
+struct ua_double_buffer_list
+{
+  struct wl_buffer *wl_buffer;
+  struct pixel *pixels;
+  struct ua_double_buffer_list *next;
+  bool used;
+};
+
+// LISTENERS
+
+static void
+do_nothing () {}
+
 
 static void
 output_mode_cb (void *data, struct wl_output *out, uint32_t flags,
                 int32_t width, int32_t height, int32_t refresh_rate)
 {
-  (void) flags;
-  (void) out;
   struct output_info *info = data;
   info->width = width;
   info->height = height;
@@ -143,108 +184,166 @@ static const struct wl_output_listener output_listener =
     do_nothing,
     output_mode_cb,
     do_nothing,
+    do_nothing
+  };
+
+static void
+motion_pointer_cb (void *data, struct wl_pointer *pointer, uint32_t time,
+                   wl_fixed_t surface_x, wl_fixed_t surface_y) {
+
+  printf ("Motion: %u, %f, %f.\n", time, wl_fixed_to_double(surface_x),
+          wl_fixed_to_double(surface_y));
+  
+}
+
+static void
+button_pointer_cb (void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state)
+{
+  if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+    printf ("Pressed %u.\n", button);
+  else
+    printf ("Released %u.\n", button);
+}
+
+static const struct wl_pointer_listener pointer_listener =
+  { do_nothing,
+    do_nothing,
+    motion_pointer_cb,
+    button_pointer_cb,
+    do_nothing,
+    do_nothing,
+    do_nothing,
+    do_nothing,
+    do_nothing };
+
+static void
+keymap_format_cb (void *data, struct wl_keyboard *keyboard, uint32_t format,
+                  int32_t fd, uint32_t keymap_size ) 
+{
+  struct ua_keyboard *kbd = data;
+  char *str = mmap (NULL, keymap_size, PROT_READ, MAP_SHARED, fd, 0);
+  xkb_keymap_unref (kbd->map);
+  kbd->map = xkb_keymap_new_from_string (kbd->ctx, str, XKB_KEYMAP_FORMAT_TEXT_V1,
+                                         XKB_KEYMAP_COMPILE_NO_FLAGS);
+  munmap (str, keymap_size);
+  close (fd);
+  xkb_state_unref (kbd->kb_state);
+  kbd->kb_state = xkb_state_new (kbd->map);
+  
+}
+
+static void
+key_cb (void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
+        uint32_t key, uint32_t state)
+{
+  (void) keyboard;
+  (void) serial;
+  (void) time;
+  struct ua_keyboard *keydata = data;
+  printf ("Key pressed: %u\n", key);
+  xkb_keysym_t keysym =
+    xkb_state_key_get_one_sym (keydata->kb_state, key+8);  
+  if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+    int_set_add (&keydata->pressed, keysym);
+  else
+    int_set_remove (&keydata->pressed, keysym);
+  char keyname[64];
+  xkb_keysym_get_name (keysym, keyname, 64);
+  printf ("Pressed key, \"%s\"\n", keyname);
+}
+
+static const struct wl_keyboard_listener keyboard_listener = 
+  {
+    keymap_format_cb,
+    do_nothing,
+    do_nothing,
+    key_cb,
+    do_nothing,
     do_nothing,
   };
-/* The important part of adding listeners is that you add the listener of a message 
-   before reading the message. As long as you add the listener before reading the 
-   message in the main loop the callback will still trigger so even though the client
-   recieved the message from the server, the imporant part is not reading it until 
-   client is ready.
-   
-   Thanks to SardemFF7 on #wayland IRC for explaining that */
 
-/* These callbacks can be though of as methods, and we can also specify fields that 
-   the object has.
-
-   In order to allow the function pointer to access the fields of the object we 
-   have to give a pointer to a struct which represents the fields. That pointer is 
-   then given as the first parameter to the function pointer. 
-
-   We have to write:
-
-   int 
-   cb (void *data)
-     {
-       int *i_ptr = data;
-       return *i_ptr;
-     }
-   static struct foo_listener foo_listener { cb };
-
-   int
-   main ()
-     {
-       int b = 3;
-       wl_foo_add_listener(bar, foo_listener, &b);
-     }
-   
-*/
-
-/* These are the user fields of the registry object. This object provides a way to 
-   access the other objects */
-struct registry_objects
+static void
+calc_capabilities (void *data, struct wl_seat *s, uint32_t cap)
 {
-  struct wl_compositor *comp;
-  /* A block of unused memory shared between server and client. Sub-blocks are carved
-     out of this block to form buffers */
-  struct wl_shm *shm;
-  /* Reference to the graphical shell */
-  struct wl_shell *shell;
-  /* A "seat", described in the documentation as a collection of keyboard, monitors, 
-     and "pointer" (mouse or touchscreen) devices. I *think* the idea is that if you 
-     have multiple thin graphical clients connected to a server that you want the 
-     mouse and keyboard and monitor that are all in some way "associated" together. 
-     So in the case of clients, the devices all associated with the same thin client*/
-  struct wl_seat *seat;
-  /* There could be multiple monitors (wl_output) so we need to have an array of 
-     monitors */
-  struct wl_output *outputs[MAX_OUTPUT];
-  /* The number of monitors actually used */
-  uint32_t output_num;
-};
+  struct input_bundle *inputs = data;
+  (void) s;
+  //Cap is a bitfield. The WL_SEAT_CAPABILITY_XXX enum is a mask
+  // that selects the corresponding bit.
+  inputs->seat = s;
+  if (cap & WL_SEAT_CAPABILITY_KEYBOARD)
+    {
+      printf ("Has a keyboard.\n");
+      inputs->keyboard.kbd = wl_seat_get_keyboard(s);
+      wl_keyboard_add_listener (inputs->keyboard.kbd, &keyboard_listener, &inputs->keyboard);
+    }
 
+  if (cap & WL_SEAT_CAPABILITY_POINTER)
+    {
+      printf ("Has a pointer.\n");
+      inputs->mouse = wl_seat_get_pointer(s);
+      wl_pointer_add_listener(inputs->mouse, &pointer_listener, NULL);
+    }
+  
+  if (cap & WL_SEAT_CAPABILITY_TOUCH)
+      printf ("Has a touchscreen.\n");
+}
+
+static const struct wl_seat_listener seat_listener = 
+  {
+    calc_capabilities,
+    do_nothing,
+  };
+
+static void
+shell_ping_respond (void *data, struct zxdg_shell_v6 *shell, uint32_t serial)
+{
+  (void) data;
+  zxdg_shell_v6_pong (shell, serial);
+}
+
+static const struct zxdg_shell_v6_listener xdg_shell_listener =
+  {
+    shell_ping_respond
+  };
 
 /* Whenever something is added to the registry our program will be notified by 
    wayland running this callback */
 static void
-global_registry_handler (void *data, /* data is the final paramter passed to 
-                                        add_listener */
-                         /* Pointer to registry this method was called on */
+global_registry_handler (void *data,
                          struct wl_registry *registry,
-                         /* Wayland ID "name" of object that became visible */
                          uint32_t id,
-                         /* The text name of object that became visible */
                          const char *interface,
-                         /* The version of the object that became visible */
                          uint32_t version) 
 {
-  struct registry_objects *objs = data;
+  struct ua_wayland_data *objs = data;
   printf("Got a registry event for %s id %d version %d \n", interface, id, version);
   if (strcmp(interface, wl_compositor_interface.name) == 0)
-    objs->comp = wl_registry_bind(registry, id, &wl_compositor_interface, 1);
-  /* The above code takes the registry called "registry" and associates the name
-     id with the object wl_compositor_interface. Also, we are using version 1 of 
-     the API */
-  /* Shell is short for graphical shell, it is the GUI program that starts and stops
-     other programs. A surface to draw on is gotten from the shell */
-  else if (strcmp(interface, wl_shell_interface.name) == 0)
-    objs->shell = wl_registry_bind(registry, id, &wl_shell_interface, 1);
-  /* The pool of memory that is shared between client and server. Buffers are carved
-     out of this pool and is what is actually put on screen */
+    {
+      objs->compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 4);
+      objs->surface = wl_compositor_create_surface (objs->compositor);
+    }
+  else if (strcmp(interface, zxdg_shell_v6_interface.name) == 0)
+    {
+      objs->shell = wl_registry_bind (registry, id, &zxdg_shell_v6_interface, 1);
+      zxdg_shell_v6_add_listener(objs->shell, &xdg_shell_listener, NULL);
+    }
   else if (strcmp(interface, wl_shm_interface.name) == 0)
     objs->shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
-  /* I believe the idea behind a seat is when you have multiple dumb, thin clients
-     connnected to a server so ther will be multiple keyboards, mice, monitors, etc.
-     but those IO devices are grouped in some way. A "seat" is a grouping of such 
-     devices */
   else if (strcmp(interface, wl_seat_interface.name) == 0)
-    objs->seat = wl_registry_bind(registry, id, &wl_seat_interface, 1);
-  /* Get all outputs, in the case that there are multiple monitors */
+    {
+      objs->inputs.seat = wl_registry_bind(registry, id, &wl_seat_interface, 5);
+      wl_seat_add_listener(objs->inputs.seat, &seat_listener, &objs->inputs);
+    }
   else if (strcmp(interface, wl_output_interface.name) == 0)
-    if (objs->output_num < MAX_OUTPUT)
-      {
-        objs->outputs[objs->output_num] = wl_registry_bind(registry, id, &wl_output_interface, 1);
-        objs->output_num++;
-      }
+    {
+      struct wl_output *wl_out = wl_registry_bind (registry, id, &wl_output_interface, 2);
+      // TODO Free
+      struct ua_wayland_output *ua_out = malloc (sizeof (struct ua_wayland_output));
+      ua_out->out = wl_out;
+      wl_output_add_listener (ua_out->out, &output_listener, &ua_out->info);
+      wl_list_insert (objs->monitors, &ua_out->link);
+    }
+  
 }
 
 /* The registry expects a pair of callbacks, one for when an object is created,
@@ -255,314 +354,470 @@ static const struct wl_registry_listener registry_listener =
     do_nothing,
   };
 
-/* In order to know if a client has become unresponsive the server will send "ping" 
-   messages and the client needs to repond with "pong" or the client will be deemed 
-   to be unresponsive */
 static void
-ping_cb (void *data, struct wl_shell_surface *shell_surface, uint32_t serial)
+surface_configure_cb (void *data, struct zxdg_surface_v6 *surface, uint32_t serial)
 {
   (void) data;
-  wl_shell_surface_pong (shell_surface, serial);
+  zxdg_surface_v6_ack_configure (surface, serial);
 }
 
-static const struct wl_shell_surface_listener shell_surface_listener = 
+static const struct zxdg_surface_v6_listener xdg_surface_listener = 
   {
-    ping_cb,
-    do_nothing,
-    do_nothing
+    surface_configure_cb,
   };
+
+static void
+toplevel_close_cb (void *data, struct zxdg_toplevel_v6 *top)
+{
+  (void) top;
+  
+  bool *b = data;
+  *b = true;
+}
+
+static const struct zxdg_toplevel_v6_listener xdg_top_listener =
+  {
+    do_nothing,
+    toplevel_close_cb
+  };
+
+static void
+buffer_release_cb (void *data, struct wl_buffer *buf)
+{
+  (void) buf;
+  bool *b = data;
+  *b = false;
+}
+
+static const struct wl_buffer_listener buffer_listener = 
+  {
+    buffer_release_cb
+  };
+
+static void
+callback_set_ready (void *data, struct wl_callback *cb, uint32_t cb_data)
+{
+  (void) cb;
+  (void) cb_data;
+  bool *ready = data;
+  *ready = true;
+}
+
+static const struct wl_callback_listener frame_limiter_listener = 
+  {
+    callback_set_ready
+  };
+
+
+// FUNCTIONS
+
+void
+time_elapsed (struct timespec *c, const struct timespec *a, const struct timespec *b) 
+{
+  c->tv_sec = a->tv_sec - b->tv_sec;
+  if (b->tv_nsec > a->tv_nsec)
+    {
+      c->tv_sec--;
+      c->tv_nsec = 1000000000;
+      c->tv_nsec += a->tv_nsec;
+      c->tv_nsec -= b->tv_nsec;
+    }
+  else
+    {
+      c->tv_nsec = a->tv_nsec - b->tv_nsec;
+    }  
+}
+
+bool
+time_lessthan (const struct timespec *a, const struct timespec *b) 
+{
+  return a->tv_sec == b->tv_sec ?
+    a->tv_nsec < b->tv_nsec :
+    a->tv_sec < b->tv_sec;
+}
+
+uint64_t
+nanoseconds (const struct timespec *t) 
+{
+  uint64_t ns = t->tv_sec * 1000000000;
+  ns += t->tv_nsec;
+  return ns;
+}
+
+void
+time_set (struct timespec *t, uint64_t seconds, uint64_t nanosec)
+{
+  t->tv_sec = seconds;
+  t->tv_nsec = nanosec;
+}
+
+static void
+render (void *buf, uint32_t width, uint32_t height)
+{
+  struct pixel (*pixel)[height][width] = buf;
+  float x_factor = 1.0 / (float) height;
+  float y_factor = 1.0 / (float) width;
+
+  for (uint32_t y = 0; y < width; y++)
+    {
+      for (uint32_t x = 0; x < height; x++) 
+        {
+          float nx = x * x_factor;
+          float ny = y * y_factor;
+          float dx = 0.5 - nx;
+          float dy = 0.5 - ny;
+          float d = sqrt (dx * dx + dy * dy);
+          (*pixel)[x][y].r = nx * 255;
+          (*pixel)[x][y].g = ny * 255;
+          (*pixel)[x][y].b = d * 255;
+          (*pixel)[x][y].a = 255;
+        }
+    }
+}
+
+// INITIALIZATION
+
+enum MEM_ERR { MEM_ERR_OK
+             , MEM_ERR_FD
+             , MEM_ERR_TRUNC
+             , MEM_ERR_MMAP
+             , MEM_ERR_POOL };
+
+static enum MEM_ERR
+init_mem(struct wl_shm *shm, struct mem *m, size_t fb_size) 
+{
+  memset (m, 0, sizeof (struct mem));
+  
+  m->raw_size = fb_size << 1;
+
+  m->fd = shm_open ("/unknown_animal_wayland_frame_buffer",
+                         O_RDWR | O_CREAT, S_IRUSR | S_IWUSR );
+  if (m->fd < 0) 
+    {
+      perror ("Could not open shared memory file.\n");
+      return MEM_ERR_FD;
+    }
+  else
+    printf ("Created shared memory file.\n");
+  
+  if (ftruncate (m->fd, m->raw_size) != 0)
+    {
+      perror ("Could not reized shared memory file.\n");
+      return MEM_ERR_TRUNC;
+    }
+  else
+    printf ("Resized chared memory file descriptor.\n");
+        
+  m->raw = mmap (NULL, m->raw_size, PROT_READ | PROT_WRITE, MAP_SHARED, m->fd,  0);
+
+  if (m->raw == MAP_FAILED)
+    {
+      perror ("Could not map file to memory.\n");
+      return MEM_ERR_MMAP;
+    }
+  else
+    printf ("Mapped file to memory.\n");
+
+  for (uint8_t *ptr = m->raw; ptr != ((uint8_t*) m->raw) + m->raw_size; ptr++)
+    *ptr = 0xFF;
+  
+  memset (m->raw, ~0, m->raw_size);
+  
+  m->pool = wl_shm_create_pool(shm, m->fd, m->raw_size);
+
+  if (m->pool == NULL) 
+    {
+      fprintf (stderr, "Could not create pool.\n");
+      return MEM_ERR_POOL;
+    }
+  else
+    printf ("Created shared memory pool\n");
+
+  return MEM_ERR_OK;
+}
+
+enum WAYLAND_SETUP_ERR
+  {
+    SETUP_OK,
+    NO_WAY_DISP,
+    NO_REG,
+    NO_COMP,
+    NO_SHELL,
+    NO_SEAT,
+    NO_SHM,
+    NO_MONITORS,
+    NO_SURFACE,
+    NO_SHELL_SURFACE,
+    NO_TOPLEVEL
+  };
+
+static enum WAYLAND_SETUP_ERR
+setup_wayland (struct ua_wayland_data *objs)
+{
+  memset (objs, 0, sizeof (struct ua_wayland_data));
+  //TODO Free, safe malloc
+  objs->monitors = malloc (sizeof (struct wl_list));
+  wl_list_init (objs->monitors);
+  
+  
+  memset (&objs->inputs, 0, sizeof (struct input_bundle));
+  int_set_init (&objs->inputs.keyboard.pressed);
+  objs->inputs.keyboard.ctx = xkb_context_new (XKB_CONTEXT_NO_FLAGS);
+  
+  objs->display = wl_display_connect (NULL);
+  if (objs->display == NULL)
+    return NO_WAY_DISP;
+  
+  objs->registry = wl_display_get_registry (objs->display);
+  if (objs->registry == NULL)
+    return NO_REG;
+  wl_registry_add_listener (objs->registry, &registry_listener, objs);
+  wl_display_roundtrip (objs->display); // Wait for registry listener to run
+  if (objs->compositor == NULL)
+    return NO_COMP;
+  if (objs->shell == NULL)
+    return NO_SHELL;
+  if (objs->inputs.seat == NULL)
+    return NO_SEAT;
+  if (objs->shm == NULL)
+    return NO_SHM;
+  if (wl_list_empty (objs->monitors))
+    return NO_MONITORS;
+  if (objs->surface == NULL)
+    return NO_SURFACE;
+
+  objs->shell_surface = zxdg_shell_v6_get_xdg_surface (objs->shell, objs->surface);
+  if (objs->shell_surface == NULL)
+    return NO_SHELL_SURFACE;
+  
+  zxdg_surface_v6_add_listener (objs->shell_surface, &xdg_surface_listener, NULL);
+
+  objs->top = zxdg_surface_v6_get_toplevel (objs->shell_surface);
+  if (objs->top == NULL)
+    return NO_TOPLEVEL;
+
+  zxdg_toplevel_v6_set_maximized (objs->top);
+  zxdg_toplevel_v6_set_title (objs->top, "Unknown Animal");
+  wl_display_roundtrip (objs->display);
+
+  return SETUP_OK;
+}
+
+static void
+destroy_wayland_data (struct ua_wayland_data *objs)
+{
+  struct ua_wayland_output *out = NULL;
+  struct wl_list *head = objs->monitors;
+  struct wl_list *current = head ->next;
+  
+  while(current != head)
+    {
+      struct wl_list *next = current->next;
+      out = container_of (current, struct ua_wayland_output, link);
+      wl_output_destroy (out->out);
+      free (out);
+      current = next;
+    }
+  free (head);
+  xkb_keymap_unref (objs->inputs.keyboard.map);
+  xkb_state_unref (objs->inputs.keyboard.kb_state);
+  xkb_context_unref (objs->inputs.keyboard.ctx);
+  wl_keyboard_destroy (objs->inputs.keyboard.kbd);
+
+  free (objs->inputs.keyboard.pressed.data);
+  free (objs->inputs.keyboard.pressed.valid);
+  
+  wl_pointer_destroy (objs->inputs.mouse);
+  wl_seat_destroy (objs->inputs.seat);
+  wl_shm_destroy (objs->shm);
+  zxdg_toplevel_v6_destroy (objs->top);
+  zxdg_surface_v6_destroy (objs->shell_surface);
+  zxdg_shell_v6_destroy (objs->shell);
+  wl_surface_destroy (objs->surface);
+  wl_compositor_destroy (objs->compositor);
+  wl_registry_destroy (objs->registry);
+  wl_display_disconnect (objs->display);
+}
+
+enum BUFFER_ERROR
+  {
+    BUFFER_OK,
+    BUFFER_NO_WL_BUF
+  };
+
+static enum BUFFER_ERROR
+init_buffers (struct ua_buffer *buf, const struct mem *mem, uint32_t width,
+              uint32_t height)
+{
+  buf->width = width;
+  buf->height = height;
+
+  buf->bufs = malloc (sizeof (struct ua_double_buffer_list));
+  buf->bufs->wl_buffer =
+    wl_shm_pool_create_buffer (mem->pool, 0, width, height,
+                               width * sizeof (struct pixel),
+                               WL_SHM_FORMAT_ARGB8888);
+  if (buf->bufs->wl_buffer == NULL)
+    return BUFFER_NO_WL_BUF;
+  
+  buf->bufs->pixels = mem->raw;
+  buf->bufs->used = false;
+  wl_buffer_add_listener (buf->bufs->wl_buffer, &buffer_listener, &buf->bufs->used);
+
+  struct ua_double_buffer_list *back_buf = malloc (sizeof (struct ua_double_buffer_list));
+  back_buf->wl_buffer =
+    wl_shm_pool_create_buffer(mem->pool, sizeof (struct pixel) * width * height,
+                              width, height, width * sizeof (struct pixel),
+                              WL_SHM_FORMAT_ARGB8888);
+  if (back_buf == NULL)
+    return BUFFER_NO_WL_BUF;
+  
+  back_buf->pixels = ((struct pixel*) mem->raw) + width * height;
+  back_buf->used = false;
+  wl_buffer_add_listener (back_buf->wl_buffer, &buffer_listener, &back_buf->used);
+
+  buf->bufs->next = back_buf;
+  back_buf->next = buf->bufs;
+
+  return BUFFER_OK;
+}
+
+static void
+free_buffers (struct ua_buffer *buf)
+{
+  if (buf == NULL || buf->bufs == NULL)
+    return;
+
+  if (buf->bufs->next != NULL)
+    {
+      wl_buffer_destroy (buf->bufs->next->wl_buffer);
+      free (buf->bufs->next);
+    }
+  wl_buffer_destroy (buf->bufs->wl_buffer);
+  free (buf->bufs);
+}
+
+static void
+free_mem (struct mem *mem)
+{
+  wl_shm_pool_destroy (mem->pool);
+  munmap (mem->raw, mem->raw_size);
+}
 
 int
 main () 
 {
-  /* There is a socket on the filesystem somewhere that programs can use to 
-     communicate with the wayland server. We want to connect to that socket.
-     We can specify a specific socket to use be we just want the default one
-     so we pass in NULL. This returns an opaque pointer to an object 
-     representing our connection to the wayland server */
-  struct wl_display *display = wl_display_connect(NULL);
-  struct registry_objects objs;
-  struct output_info output_info[MAX_OUTPUT];
-  
-  memset (&objs, 0, sizeof(objs));
-  memset (&output_info, 0, sizeof (struct output_info) * MAX_OUTPUT);
-  
-  int status = EXIT_SUCCESS;
+  struct ua_wayland_data objs;
+  struct mem mem;
+  struct ua_buffer buf;
+  struct ua_double_buffer_list *current;
 
-  CHECK_NULL (display,
-              exit,
-              "Could not connect to wayland display.\n",
-              "Connected to wayland display.\n");
-  
-  /* There are many objects contained in the server that we would like to use.
-     these objects are contained in a registry on the server */
-  struct wl_registry *registry = wl_display_get_registry (display);
-  CHECK_NULL (registry,
-              disconnect_display,
-              "Could not get registry form display.\n",
-              "Got registry from display.\n");
-  
-  wl_registry_add_listener (registry, &registry_listener, &objs);
-
-  /* Messages created by our client are initially just queued to be sent but are not
-     actually sent. For exaple, wl_registry_add_listener will add an event to the 
-     queue but will not actually notify the server directly. "wl_display_dispatch"
-     will send all of the messages in the queue to the server. */
-
-  /* wl_display_roundtrip will just sit and wait for the server's response. Wayland 
-     is an asyncronous API so normally we wouldn't want to wait for the server 
-     response but in this case we can't do anything until we have the compositor
-     anyhow so we might as well wait */
-  wl_display_roundtrip (display);
-  /* Since we are done with the registry we can destroy it now. */
-  wl_registry_destroy (registry);
-  printf ("Destroyed registry.\n");
-
-  /* Check that all of the objects from the registry were found. */
-  CHECK_NULL (objs.comp,
-              disconnect_display,
-              "Could not find compositor.\n",
-              "Found compositor.\n");
-
-  CHECK_NULL (objs.shell,
-              destroy_compositor,
-              "Could not find graphical shell.\n",
-              "Found graphical shell\n");
-  
-  CHECK_NULL (objs.seat,
-              destroy_shell,
-              "Could not find seat.\n",
-              "Found seat.\n");
-
-  /* An shm object is a handle that allows creation of pools of shared memory and
-     informs the client (that's us!) about supported memory formats. So if would want
-     AYCbCr Layout for some reason we would check the shm object to see if that is 
-     supported by the server. However, the wayland specification requires all servers
-     to support ARBG 8-bit layout so that is the one we will use and won't bother
-     checking. */
-  CHECK_NULL (objs.shm,
-              destroy_seat,
-              "Could not find shared memory.\n",
-              "Found shared memory.\n");
-
-  CHECK_COND(objs.output_num == 0,
-             destroy_shm,
-             "No output devices found.\n",
-             "Found monitors.\n");
-
-  /* Get information about each output */
-  for (size_t i = 0; i < objs.output_num; i++)
-     wl_output_add_listener (objs.outputs[i], &output_listener, &output_info[i]);
-
-  /* The listener we added won't be triggered until we  actually read events */
-  /* Important to remember that if a callback segfaults, gdb will have problems 
-     telling you exactly where the segfault occured */
-  wl_display_roundtrip (display); /* Wait for server to aknowledge our message */
-  
-  for (size_t i = 0; i < objs.output_num; i++)
-    printf ("Monitor resolution: %d pixels by %d pixels at %dmHz\n",
-            output_info[i].width, output_info[i].height, output_info[i].hertz);
-
-  /* We'd like to use the shm object to create a shared memory pool and then use the
-     shared memory pool to create frame buffers that we can then use to acutally
-     display things, but we need to know the size of the monitors in order to know
-     how much memory to allocate. We don't know which monitor the user wants the 
-     display to be on. We might also want to deal with "hotswapping" monitors. 
-     We will have to do something smarter than this in a real program but for now we
-     will arbitrarily choose a monitor. */
-
-  /* First we need to create an in memory "file". We then us mmap to turn that "file"
-     into an actual memory buffer. */
-  /* This creates an acutal file in the file system so if we run two instances of 
-     the program at the same time this will fail, except maybe not? The O_CREAT flag
-     might create a object with new name */
-  int mem_fd = shm_open ("/unknown_animal_wayland_frame_buffer",
-                         O_RDWR | O_CREAT, S_IRUSR | S_IWUSR );
-  CHECK_COND(mem_fd < 0,
-             destroy_outputs,
-             "Could not open shared memory file",
-             "Created shared memory file.\n");
-  
-  const size_t width = output_info[0].width;
-  const size_t height = output_info[0].height;
-  const size_t num_px = width * height;
-  const size_t fb_bs = num_px * sizeof (struct pixel);
-
-  CHECK_COND(ftruncate (mem_fd, fb_bs) != 0,
-             unlink_shm,
-             "Could not reized shared memory file",
-             "Resized chared memory file descriptor.\n");
-        
-  struct pixel *raw_pixels =
-    mmap (NULL, fb_bs, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd,  0);
-
-  CHECK_COND(raw_pixels == MAP_FAILED,
-             unlink_shm,
-             "Could not map file to memory",
-             "Mapped file to memory.\n");
-  
-  for (uint32_t i = 0; i < num_px; i++)
+  if (setup_wayland (&objs) != SETUP_OK)
     {
-      raw_pixels[i].a = 255;
-      raw_pixels[i].r = 0;
-      raw_pixels[i].g = 0;
-      raw_pixels[i].b = 255;
+      destroy_wayland_data (&objs);
+      return EXIT_FAILURE;
     }
-      
   
-  struct wl_shm_pool *pool = wl_shm_create_pool(objs.shm, mem_fd, fb_bs);
+  struct ua_wayland_output *out = container_of (objs.monitors->next,
+                                                struct ua_wayland_output,
+                                                link);
+  const size_t width = out->info.width;
+  const size_t height = out->info.height;
+  const size_t num_px = width * height;
+  const size_t fb_size = num_px * sizeof (struct pixel);
+  printf ("(%lu, %lu)\n", width, height);
 
-  CHECK_NULL (pool,
-              unmap_fb,
-              "Could not create pool\n",
-              "Created shared memory pool\n");
+  bool close = false;
 
-  /* Next that we have a chunk of shared memory and put it into a wl_shm_pool, we
-     need to create a buffer from that pool and then bind that buffer to a surface.
-     once that is done we should, fingers crossed, be able to display that surface
-     on the screen. */
+  zxdg_toplevel_v6_set_fullscreen (objs.top, out->out);
+  zxdg_toplevel_v6_add_listener (objs.top, &xdg_top_listener, &close);
   
-  /* A surface is just some rectangualar grid that the client can draw on */
-  struct wl_surface *surface = wl_compositor_create_surface (objs.comp);
-  
-  CHECK_NULL (surface,
-              destroy_shm_pool,
-              "Could not create surface from compositor.\n",
-              "Created surface from compositor.\n");
-  
-
-  /* A shell surface is like a surface but it is provided by the graphical shell 
-     that started the client program. I am not fully certain of the rational behind
-     having a distinction between a shell_surface and a normal surfae. */
-  struct wl_shell_surface *shell_surface = wl_shell_get_shell_surface (objs.shell,
-                                                                       surface);
-  CHECK_NULL (shell_surface,
-              destroy_surface,
-              "Could not create shell surface.\n",
-              "Created shell surface.\n");
-
-  wl_shell_surface_add_listener (shell_surface, &shell_surface_listener, 0);
-
-  struct wl_buffer *way_fb =
-    wl_shm_pool_create_buffer (pool, 0,
-                               output_info[0].width,
-                               output_info[0].height,
-                               output_info[0].width * sizeof(struct pixel),
-                               WL_SHM_FORMAT_ARGB8888);
-  
-  CHECK_NULL (way_fb,
-              destroy_shell_surface,
-              "Could not create screen buffer.\n",
-              "Created screen buffer.\n");
-  
-  wl_shell_surface_set_fullscreen (shell_surface,
-                                   WL_SHELL_SURFACE_FULLSCREEN_METHOD_DEFAULT,
-                                   output_info[0].hertz, objs.outputs[0]);
-
-  /* String must be utf-8 encoded */
-  wl_shell_surface_set_title (shell_surface, "Wayland Example");
-
-  /* Wait for half a second before drawing the next frame */
-  struct timespec sleep;
-  sleep.tv_nsec = 500000000;
-  sleep.tv_sec = 0;
-
-  uint32_t frame_num = 0;
-  
-  while (frame_num < 10)
+  enum MEM_ERR e = init_mem (objs.shm, &mem, fb_size);
+  if (e != MEM_ERR_OK)
     {
-      uint8_t red = ((frame_num % 3) == 0) * 255;
-      uint8_t green = ((frame_num % 3) == 1) * 255;
-      uint8_t blue = ((frame_num % 3) == 2) * 255;
+      destroy_wayland_data (&objs);
+      return EXIT_FAILURE;
+    }
 
-      /* Simple rendering, strobe effect. In a real program this is where we would
-         do the rendering. */
-      for (uint32_t i = 0; i < num_px; i++)
+  wl_surface_commit(objs.surface);
+
+  if (init_buffers (&buf, &mem, width, height) != BUFFER_OK)
+    {
+      free_buffers (&buf);
+      destroy_wayland_data (&objs);
+    }
+
+  wl_display_roundtrip (objs.display);
+  
+  uint32_t fb_index = 0;
+
+  struct wl_callback *ready_cb = NULL;
+  bool ready = true;
+
+  struct timespec last_frame;
+  struct timespec current_frame;
+  struct timespec frame_delta;
+  struct timespec sleep_time;
+  struct timespec limit;
+
+  memset (&last_frame, 0, sizeof (struct timespec));
+  memset (&current_frame, 0, sizeof (struct timespec));
+  memset (&frame_delta, 0, sizeof (struct timespec));
+  memset (&sleep_time, 0, sizeof (struct timespec));
+  memset (&limit, 0, sizeof (struct timespec));
+  
+  time_set (&limit, 0, 40000000);
+  
+  clock_settime (CLOCK_MONOTONIC_RAW, &last_frame);
+  current_frame = last_frame;
+
+  const xkb_keysym_t esc_sym = xkb_keysym_from_name ("Escape", XKB_KEYSYM_NO_FLAGS);
+
+  current = buf.bufs;
+  
+  while (!close)
+    {
+      if (!current->used && ready)
         {
-          raw_pixels[i].r = red;
-          raw_pixels[i].g = green;
-          raw_pixels[i].b = blue;
+          ready = false;
+          current->used = true;
+          if (ready_cb != NULL)
+            wl_callback_destroy (ready_cb);
+          ready_cb = wl_surface_frame (objs.surface);
+          wl_callback_add_listener (ready_cb, &frame_limiter_listener, &ready);
+          
+          fb_index = (fb_index + 1) & 1;
+
+          render (current->pixels, width, height);
+          wl_surface_attach (objs.surface, current->wl_buffer, 0, 0);
+          wl_surface_damage (objs.surface, 0, 0, width, height);
+          wl_surface_commit (objs.surface);
+          current = current->next;
         }
       
-      /* Set the new contents of the surface */
-      wl_surface_attach (surface, way_fb, 0, 0);
-      /* Redraw the entire surface */
-      wl_surface_damage (surface, 0, 0, width, height);
-
-      /* Swap frame buffer */
-      /* All wayland surfaces are double buffered by the server. So if we make a 
-         change to the backing array of data that change will not be visible until 
-         calling wl_surface_commit, at which point the server will replace what it 
-         displays to the user with the updated buffer */
-      wl_surface_commit (surface);
-
-      /* Normal wl_display_dispatch will wait to recieve a message if there is not 
-         one from the server. wl_display_dispatch pending not block on no messages */
-      if (wl_display_dispatch_pending (display) < 0)
+      if (wl_display_dispatch (objs.display) < 0)
         {
           fprintf (stderr, "Could not dispatch messages in main loop.\n");
           break;
         }
-      /* Send messages from the client to the server */
-      if (wl_display_flush (display) < 0)
-        {
-          perror ("Could not flush data ");
-          break;
-        }
 
-      nanosleep (&sleep, NULL);
-      frame_num++;
+      if (int_set_contains(&objs.inputs.keyboard.pressed, esc_sym))
+        close = true;
+          
+      last_frame = current_frame;
+      clock_settime (CLOCK_MONOTONIC_RAW, &current_frame);
+      time_elapsed (&frame_delta, &current_frame, &last_frame);
+      if (time_lessthan (&frame_delta, &limit))
+        {
+          time_elapsed (&sleep_time, &limit, &frame_delta);
+          nanosleep (&sleep_time, NULL);
+        }
    }
-  
-  /* Cleanup everything we created */
-  wl_buffer_destroy (way_fb);
-  printf ("Destroyed screen buffer.\n");
- destroy_shell_surface:
-  wl_shell_surface_destroy (shell_surface);
-  shell_surface = NULL;
-  printf ("Destroyed shell surface.\n");
- destroy_surface:
-  wl_surface_destroy (surface);
-  surface = NULL;
-  printf ("Destroyed surface.\n");
- destroy_shm_pool:
-  wl_shm_pool_destroy(pool);
-  pool = NULL;
-  printf ("Destroyed shared memory pool.\n");
- unmap_fb:
-  munmap (raw_pixels, fb_bs);
-  raw_pixels = NULL;
-  printf ("Unmaped framebuffer.\n");
- unlink_shm:
-  shm_unlink ("unknown_animal_wayland_frame_buffer");
-  printf ("Closed shared memory file.\n");
- destroy_outputs:
-  for (size_t i = 0; i < objs.output_num; i++)
-    {
-      wl_output_destroy(objs.outputs[i]);
-      objs.outputs[i] = NULL;
-      printf ("Destroyed output %lu\n", i);
-    }
- destroy_shm:
-  wl_shm_destroy(objs.shm);
-  objs.shm = NULL;
-  printf ("Destroyed shared memory.\n");
- destroy_seat:
-  wl_seat_destroy(objs.seat);
-  objs.seat = NULL;
-  printf ("Destroyed seat.\n");
- destroy_shell:
-  wl_shell_destroy(objs.shell);
-  objs.shell = NULL;
-  printf ("Destroyed shell.\n");
- destroy_compositor:
-  wl_compositor_destroy(objs.comp);
-  objs.comp = NULL;
-  printf ("Destroyed compositor.\n");
- disconnect_display:
-  wl_display_disconnect (display);
-  display = NULL;
+
+  wl_callback_destroy (ready_cb);
+  free_buffers (&buf);
+  free_mem (&mem);
+  destroy_wayland_data (&objs);
   printf ("Disconnected from display.\n");
- exit:  
-  return status;
+  return EXIT_SUCCESS;
 }
