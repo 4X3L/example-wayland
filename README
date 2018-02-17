@@ -1,1 +1,1 @@
-An example of a simple wayland client on Linux. Renders a fullscreen window flashing red, green, then blue. If you notice any errors let me know. 
+An example of a simple wayland client on Linux. I tried to comment it well and make it readable. If you notice any errors or ways to improve the code let me know. 

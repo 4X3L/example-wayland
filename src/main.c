@@ -58,28 +58,6 @@
         const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
         (type *)( (char *)__mptr - offsetof(type,member) );})
 
-/* We will be checking if things failed a lot. */
-#define CHECK_COND(cond,label,fail,success) if (cond)                 \
-    {                                                                 \
-      if (errno != 0)                                                 \
-        perror (fail);                                                \
-      else                                                            \
-        fprintf (stderr, fail);                                       \
-      status = EXIT_FAILURE;                                          \
-      goto label;                                                     \
-    } else printf (success);                                    
-
-#define CHECK_NULL(ptr,label,fail,success) if (ptr == NULL)             \
-    {                                                                   \
-  if (errno != 0)                                                       \
-    perror (fail);                                                      \
-  else                                                                  \
-    fprintf (stderr, fail);                                             \
-  status = EXIT_FAILURE;                                                \
-  goto label;                                                           \
-    }                                                                   \
-  else printf (success);
-
 // STRUCTS
 
 /* Wayland protocol specifies that all servers support ARGB (8-bit x4) layout so we 
@@ -100,7 +78,9 @@ struct output_info
   int32_t hertz;
 };
 
-struct ua_keyboard 
+/* Contains a set of pressed keys, a xkbcommon map from keycodes to keysyms, 
+   and a wayland keyboard proxy object */
+struct keyboard 
 {
   struct wl_keyboard *kbd;
   struct int_set pressed;
@@ -113,12 +93,13 @@ struct ua_keyboard
 
 struct input_bundle
 {
-  struct ua_keyboard keyboard;
+  struct keyboard keyboard;
   struct wl_pointer *mouse;
   struct wl_seat *seat;
 };
 
-struct ua_wayland_data 
+/* The set of data sent to the registry callback */
+struct wayland_data 
 {
   struct wl_display *display;
   struct wl_registry *registry;
@@ -133,13 +114,17 @@ struct ua_wayland_data
   struct input_bundle inputs;
 };
 
-struct ua_wayland_output
+/* A node in a doubly linked list containing a pointer to a wayland output
+   object and info about that output */
+struct wayland_output
 {
   struct wl_output *out;
   struct output_info info;
   struct wl_list link;
 };
 
+/* Contains information about the memory that is shared between the client
+   and server */
 struct mem 
 {
   void *raw;
@@ -148,18 +133,23 @@ struct mem
   struct wl_shm_pool *pool;
 };
 
-struct ua_buffer
+/* Holds the dimensions of the render buffer and a circular list of two buffers,
+   the front and back buffers. */
+struct buffer
 {
   uint32_t width;
   uint32_t height;
-  struct ua_double_buffer_list *bufs;
+  struct double_buffer_list *bufs;
 };
 
-struct ua_double_buffer_list
+/* A pointer to the corresponding wayland buffer, a pointer to the memory that
+   is represented by this buffer, a pointer to the other buffer, and a boolean
+   indicating if this buffer is in use. */
+struct double_buffer_list
 {
   struct wl_buffer *wl_buffer;
   struct pixel *pixels;
-  struct ua_double_buffer_list *next;
+  struct double_buffer_list *next;
   bool used;
 };
 
@@ -168,7 +158,8 @@ struct ua_double_buffer_list
 static void
 do_nothing () {}
 
-
+/* Gets info about the height and width of the monitor, fires when the monitor
+   is found */
 static void
 output_mode_cb (void *data, struct wl_output *out, uint32_t flags,
                 int32_t width, int32_t height, int32_t refresh_rate)
@@ -220,7 +211,7 @@ static void
 keymap_format_cb (void *data, struct wl_keyboard *keyboard, uint32_t format,
                   int32_t fd, uint32_t keymap_size ) 
 {
-  struct ua_keyboard *kbd = data;
+  struct keyboard *kbd = data;
   char *str = mmap (NULL, keymap_size, PROT_READ, MAP_SHARED, fd, 0);
   xkb_keymap_unref (kbd->map);
   kbd->map = xkb_keymap_new_from_string (kbd->ctx, str, XKB_KEYMAP_FORMAT_TEXT_V1,
@@ -239,7 +230,7 @@ key_cb (void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time
   (void) keyboard;
   (void) serial;
   (void) time;
-  struct ua_keyboard *keydata = data;
+  struct keyboard *keydata = data;
   printf ("Key pressed: %u\n", key);
   xkb_keysym_t keysym =
     xkb_state_key_get_one_sym (keydata->kb_state, key+8);  
@@ -315,7 +306,7 @@ global_registry_handler (void *data,
                          const char *interface,
                          uint32_t version) 
 {
-  struct ua_wayland_data *objs = data;
+  struct wayland_data *objs = data;
   printf("Got a registry event for %s id %d version %d \n", interface, id, version);
   if (strcmp(interface, wl_compositor_interface.name) == 0)
     {
@@ -338,7 +329,7 @@ global_registry_handler (void *data,
     {
       struct wl_output *wl_out = wl_registry_bind (registry, id, &wl_output_interface, 2);
       // TODO Free
-      struct ua_wayland_output *ua_out = malloc (sizeof (struct ua_wayland_output));
+      struct wayland_output *ua_out = malloc (sizeof (struct wayland_output));
       ua_out->out = wl_out;
       wl_output_add_listener (ua_out->out, &output_listener, &ua_out->info);
       wl_list_insert (objs->monitors, &ua_out->link);
@@ -552,9 +543,9 @@ enum WAYLAND_SETUP_ERR
   };
 
 static enum WAYLAND_SETUP_ERR
-setup_wayland (struct ua_wayland_data *objs)
+setup_wayland (struct wayland_data *objs)
 {
-  memset (objs, 0, sizeof (struct ua_wayland_data));
+  memset (objs, 0, sizeof (struct wayland_data));
   //TODO Free, safe malloc
   objs->monitors = malloc (sizeof (struct wl_list));
   wl_list_init (objs->monitors);
@@ -604,16 +595,16 @@ setup_wayland (struct ua_wayland_data *objs)
 }
 
 static void
-destroy_wayland_data (struct ua_wayland_data *objs)
+destroy_wayland_data (struct wayland_data *objs)
 {
-  struct ua_wayland_output *out = NULL;
+  struct wayland_output *out = NULL;
   struct wl_list *head = objs->monitors;
   struct wl_list *current = head ->next;
   
   while(current != head)
     {
       struct wl_list *next = current->next;
-      out = container_of (current, struct ua_wayland_output, link);
+      out = container_of (current, struct wayland_output, link);
       wl_output_destroy (out->out);
       free (out);
       current = next;
@@ -646,13 +637,13 @@ enum BUFFER_ERROR
   };
 
 static enum BUFFER_ERROR
-init_buffers (struct ua_buffer *buf, const struct mem *mem, uint32_t width,
+init_buffers (struct buffer *buf, const struct mem *mem, uint32_t width,
               uint32_t height)
 {
   buf->width = width;
   buf->height = height;
 
-  buf->bufs = malloc (sizeof (struct ua_double_buffer_list));
+  buf->bufs = malloc (sizeof (struct double_buffer_list));
   buf->bufs->wl_buffer =
     wl_shm_pool_create_buffer (mem->pool, 0, width, height,
                                width * sizeof (struct pixel),
@@ -664,7 +655,7 @@ init_buffers (struct ua_buffer *buf, const struct mem *mem, uint32_t width,
   buf->bufs->used = false;
   wl_buffer_add_listener (buf->bufs->wl_buffer, &buffer_listener, &buf->bufs->used);
 
-  struct ua_double_buffer_list *back_buf = malloc (sizeof (struct ua_double_buffer_list));
+  struct double_buffer_list *back_buf = malloc (sizeof (struct double_buffer_list));
   back_buf->wl_buffer =
     wl_shm_pool_create_buffer(mem->pool, sizeof (struct pixel) * width * height,
                               width, height, width * sizeof (struct pixel),
@@ -683,7 +674,7 @@ init_buffers (struct ua_buffer *buf, const struct mem *mem, uint32_t width,
 }
 
 static void
-free_buffers (struct ua_buffer *buf)
+free_buffers (struct buffer *buf)
 {
   if (buf == NULL || buf->bufs == NULL)
     return;
@@ -707,10 +698,10 @@ free_mem (struct mem *mem)
 int
 main () 
 {
-  struct ua_wayland_data objs;
+  struct wayland_data objs;
   struct mem mem;
-  struct ua_buffer buf;
-  struct ua_double_buffer_list *current;
+  struct buffer buf;
+  struct double_buffer_list *current;
 
   if (setup_wayland (&objs) != SETUP_OK)
     {
@@ -718,8 +709,8 @@ main ()
       return EXIT_FAILURE;
     }
   
-  struct ua_wayland_output *out = container_of (objs.monitors->next,
-                                                struct ua_wayland_output,
+  struct wayland_output *out = container_of (objs.monitors->next,
+                                                struct wayland_output,
                                                 link);
   const size_t width = out->info.width;
   const size_t height = out->info.height;
